@@ -1,4 +1,4 @@
-PFPGrowth-in-SPARK
+Parallelized FPGrowth in Spark Engine
 ==================
 
 Trying to implement parallelized fpgrowth using MapReduce method in Spark engine.
