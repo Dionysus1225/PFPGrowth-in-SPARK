@@ -1,8 +1,10 @@
 package PFPGrowth_in_SPARK;
 
-import java.util.HashMap;
+import java.io.DataOutput;
+import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.mahout.math.list.IntArrayList;
 import org.apache.mahout.math.map.OpenObjectIntHashMap;
 import org.apache.mahout.math.set.OpenIntHashSet;
@@ -30,7 +32,7 @@ public class Main
 	{
 
 		createSparkContext();
-		JavaRDD<String> transactions=sc.textFile("records1305291335898081541.tmp",minPartitions());
+		JavaRDD<String> transactions=sc.textFile("records8713821771304460493.tmp",minPartitions());
 		JavaRDD<NumericLine> parsedTransactions = transactions.map(new ParseRecordLine());
 		//1.parallel counting
 		//1.1 map 
@@ -48,17 +50,42 @@ public class Main
 					}});
 
 		FLIST_SIZE=counts.count();
-		//testing:
+		//converting to fmap
+		OpenObjectIntHashMap<Integer> fMap = new OpenObjectIntHashMap<Integer>();
 		List<Tuple2<Integer,Integer>> tempList=counts.toArray();
 		for (Tuple2<Integer,Integer> tuple : tempList){
-			System.out.println("Item " + tuple._1 + " has support " + tuple._2);
+			fMap.put(tuple._1, tuple._2);
 		}
-		System.out.println("Total number of items: "+tempList.size());
-
+		
+		//testing:================================================
+//		List<Tuple2<Integer,Integer>> tempList=counts.toArray();
+//		for (Tuple2<Integer,Integer> tuple : tempList){
+//			
+//			
+//			System.out.println("Item " + tuple._1 + " has support " + tuple._2);
+//		}
+//		System.out.println("Total number of items: "+tempList.size());
+		//========================================================
+		
 		//2.parallel fpgrowth
 		
 		//2.1 return for each item its gourpID and Transaction Tree - like in ParallelFPGrowthMapper
-		//parsedTransactions.mapToPair(new ParallelMapper());
+		JavaRDD<List<Pair<Integer, TransactionTree>>> groupLists=parsedTransactions.map(new ParallelMapperToLists(fMap,FLIST_SIZE,NUM_GROUPS_DEFAULT));
+		//TODO: in the future fine to replace next 2 steps (transformation + action) into one step (transformation only)
+		List<Pair<Integer, TransactionTree>> groupTreeList = groupLists.reduce(new ParallelReducerToGroups ()) ;
+		JavaRDD<Pair<Integer, TransactionTree>> groupTreesRDD=sc.parallelize(groupTreeList);
+		
+		//testing==========================================================
+		List<Pair<Integer,TransactionTree>> newList=groupTreesRDD.toArray();
+		for (Pair<Integer,TransactionTree> tuple : newList){
+			System.out.println("GroupID " + tuple.getFirst() + " has tree " + tuple.getSecond().toString());
+		}
+		//TODO: groupid is unique or not? 
+		//==================================================================
+		
+		//2.2 apply fpgrowth for each tree like in ParallelFPGrowthReducer
+		//JavaRDD<Pair<Integer,Integer>> patternSupport=groupTreesRDD.map
+		
 		//3.aggregating algorithm
 
 	}
@@ -85,10 +112,9 @@ public class Main
 		return numOfCores*3; //JS: Spark tuning: minSplits=numOfCores*3
 	}
 
-	/***
-	 * Parser extends Function<String, CandidateBlock> for parsing lines from the text files in SPARK.
-	 */
 	static class ParseRecordLine implements Function<String, NumericLine> {
+
+		private static final long serialVersionUID = 1L;
 
 		public NumericLine call(String line) {
 			return new NumericLine(line);
@@ -97,54 +123,81 @@ public class Main
 
 	static class ItemsMapper implements PairFunction<Integer, Integer, Integer> {
 
+		private static final long serialVersionUID = 1L;
+
 		public Tuple2<Integer, Integer> call(Integer item) { 
 			return new Tuple2<Integer, Integer>(item, 1); 
 		}
 	}
 	
-	static class ParallelMapper implements PairFunction<NumericLine, Integer, List<Integer>> {
-		private final OpenObjectIntHashMap<Integer> fMap = new OpenObjectIntHashMap<Integer>();
+	static class ParallelMapperToLists implements Function<NumericLine, List<Pair<Integer,TransactionTree>>> {
+
+		private static final long serialVersionUID = 1L;
+		private OpenObjectIntHashMap<Integer> fMap = new OpenObjectIntHashMap<Integer>();
+		//private OpenIntHashSet groups = new OpenIntHashSet();
+		private long flistSize;
+		private int numPerGroup;
+		
 		//private final IntWritable wGroupID = new IntWritable();
 		
-		public Tuple2<Integer, List<Integer>> call(NumericLine line) { 
-			//Tuple2<Integer, TransactionTree> retVal=new Tuple2<Integer, TransactionTree>(null,null);
-			List<Integer> items = line.getValues();
-			 OpenIntHashSet itemSet = new OpenIntHashSet();
-
-			    for (Integer item : items) {
-			      if (fMap.containsKey(item) && item!=null) {
-			        itemSet.add(fMap.get(item));
-			      }
-			    }
-
-			    IntArrayList itemArr = new IntArrayList(itemSet.size());
-			    itemSet.keys(itemArr);
-			    itemArr.sort();
-			    
-			    OpenIntHashSet groups = new OpenIntHashSet();
-			    for (int j = itemArr.size() - 1; j >= 0; j--) {
-			      // generate group dependent shards
-			      int item = itemArr.get(j);
-			      int groupID = getGroupID(item);
-			        
-			      if (!groups.contains(groupID)) {
-			        IntArrayList tempItems = new IntArrayList(j + 1);
-			        tempItems.addAllOfFromTo(itemArr, 0, j);
-			        //context.setStatus("Parallel FPGrowth: Generating Group Dependent transactions for: " + item);
-			        //retVal._1=groupID;
-			        //retVal._2= new TransactionTree(tempItems, 1L);
-			      }
-			      groups.add(groupID);
-			    }
-			return null;//new Tuple2<Integer, Integer>(item, 1); 
+		public ParallelMapperToLists(OpenObjectIntHashMap<Integer> fMap, long flistSzie, int numPerGroup){
+			this.fMap=fMap;
+			this.flistSize=flistSzie;
+			this.numPerGroup=numPerGroup;
 		}
-		//TODO: we have to return tuple <groupID, TransactionTree> for each item
-		//so we can map lines to pairs <item, line> and each pair map to required tuple..
 		
+		public List<Pair<Integer, TransactionTree>> call(NumericLine line)
+				throws Exception {
+			List<Pair<Integer, TransactionTree>> retVal=new ArrayList<Pair<Integer,TransactionTree>>();
+			List<Integer> items = line.getValues();
+			OpenIntHashSet itemSet = new OpenIntHashSet();
+
+			for (Integer item : items) {
+				if (fMap.containsKey(item) && item!=null) {
+					itemSet.add(fMap.get(item));
+				}
+			}
+
+			IntArrayList itemArr = new IntArrayList(itemSet.size());
+			itemSet.keys(itemArr);
+			itemArr.sort();
+
+			OpenIntHashSet groups = new OpenIntHashSet();
+			for (int j = itemArr.size() - 1; j >= 0; j--) {
+
+				// generate group dependent shards
+				int item = itemArr.get(j);
+				int groupID = getGroupID(item);
+
+				if (!groups.contains(groupID)) {
+
+					IntArrayList tempItems = new IntArrayList(j + 1);
+					tempItems.addAllOfFromTo(itemArr, 0, j);
+					//context.setStatus("Parallel FPGrowth: Generating Group Dependent transactions for: " + item);
+					retVal.add(new Pair<Integer, TransactionTree>(groupID, new TransactionTree(tempItems, 1L)));
+				}
+				groups.add(groupID);
+			}
+			return retVal;
+		}
+	
 		private int getGroupID (int item){
-			int maxPerGroup = (int)FLIST_SIZE/NUM_GROUPS_DEFAULT;
+			int maxPerGroup = (int)flistSize/numPerGroup;
 			return item/maxPerGroup;
 		}
+	}
+	
+	static class ParallelReducerToGroups implements Function2<List<Pair<Integer,TransactionTree>>, List<Pair<Integer,TransactionTree>>, List<Pair<Integer,TransactionTree>>>{
+		 
+		private static final long serialVersionUID = 1L;
+
+		public List<Pair<Integer, TransactionTree>> call(
+				List<Pair<Integer, TransactionTree>> list1,
+				List<Pair<Integer, TransactionTree>> list2) throws Exception {
+			list1.addAll(list2);
+			return list1;
+		}
+
 	}
 
 
