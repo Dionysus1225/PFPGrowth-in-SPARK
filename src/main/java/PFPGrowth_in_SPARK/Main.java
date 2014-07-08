@@ -15,6 +15,7 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
 
 import scala.Tuple2;
@@ -56,36 +57,34 @@ public class Main
 		for (Tuple2<Integer,Integer> tuple : tempList){
 			fMap.put(tuple._1, tuple._2);
 		}
-		
+
 		//testing:================================================
-//		List<Tuple2<Integer,Integer>> tempList=counts.toArray();
-//		for (Tuple2<Integer,Integer> tuple : tempList){
-//			
-//			
-//			System.out.println("Item " + tuple._1 + " has support " + tuple._2);
-//		}
-//		System.out.println("Total number of items: "+tempList.size());
+		//		List<Tuple2<Integer,Integer>> tempList=counts.toArray();
+		//		for (Tuple2<Integer,Integer> tuple : tempList){
+		//			
+		//			
+		//			System.out.println("Item " + tuple._1 + " has support " + tuple._2);
+		//		}
+		//		System.out.println("Total number of items: "+tempList.size());
 		//========================================================
-		
+
 		//2.parallel fpgrowth
-		
+
 		//2.1 return for each item its gourpID and Transaction Tree - like in ParallelFPGrowthMapper
-		JavaRDD<List<Pair<Integer, TransactionTree>>> groupLists=parsedTransactions.map(new ParallelMapperToLists(fMap,FLIST_SIZE,NUM_GROUPS_DEFAULT));
-		//TODO: in the future fine to replace next 2 steps (transformation + action) into one step (transformation only)
-		List<Pair<Integer, TransactionTree>> groupTreeList = groupLists.reduce(new ParallelReducerToGroups ()) ;
-		JavaRDD<Pair<Integer, TransactionTree>> groupTreesRDD=sc.parallelize(groupTreeList);
-		
+		JavaPairRDD<Integer, TransactionTree> gIDtransTree=parsedTransactions.flatMapToPair(new ParallelMapper(fMap,FLIST_SIZE,NUM_GROUPS_DEFAULT));
+
 		//testing==========================================================
-		List<Pair<Integer,TransactionTree>> newList=groupTreesRDD.toArray();
-		for (Pair<Integer,TransactionTree> tuple : newList){
-			System.out.println("GroupID " + tuple.getFirst() + " has tree " + tuple.getSecond().toString());
-		}
-		//TODO: groupid is unique or not? 
+		//		List<Tuple2<Integer, TransactionTree>> newList=gIDtransTree.toArray();
+		//		for (Tuple2<Integer,TransactionTree> tuple : newList){
+		//			System.out.println("GroupID " + tuple._1 + " has tree " + tuple._2.toString());
+		//		}
+		//Q: groupid is unique or not? yes for each Ti
 		//==================================================================
-		
+
 		//2.2 apply fpgrowth for each tree like in ParallelFPGrowthReducer
-		//JavaRDD<Pair<Integer,Integer>> patternSupport=groupTreesRDD.map
-		
+		//must get pattern (set) and its support 
+		JavaPairRDD<List<Integer>,Integer> patternSupport=gIDtransTree.reduce(new ParallelReducer(fMap) );
+
 		//3.aggregating algorithm
 
 	}
@@ -129,26 +128,26 @@ public class Main
 			return new Tuple2<Integer, Integer>(item, 1); 
 		}
 	}
-	
-	static class ParallelMapperToLists implements Function<NumericLine, List<Pair<Integer,TransactionTree>>> {
+
+	static class ParallelMapper implements PairFlatMapFunction<NumericLine, Integer,TransactionTree> {
 
 		private static final long serialVersionUID = 1L;
 		private OpenObjectIntHashMap<Integer> fMap = new OpenObjectIntHashMap<Integer>();
 		//private OpenIntHashSet groups = new OpenIntHashSet();
 		private long flistSize;
 		private int numPerGroup;
-		
+
 		//private final IntWritable wGroupID = new IntWritable();
-		
-		public ParallelMapperToLists(OpenObjectIntHashMap<Integer> fMap, long flistSzie, int numPerGroup){
+
+		public ParallelMapper(OpenObjectIntHashMap<Integer> fMap, long flistSzie, int numPerGroup){
 			this.fMap=fMap;
 			this.flistSize=flistSzie;
 			this.numPerGroup=numPerGroup;
 		}
-		
-		public List<Pair<Integer, TransactionTree>> call(NumericLine line)
+
+		public Iterable<Tuple2<Integer, TransactionTree>> call(NumericLine line)
 				throws Exception {
-			List<Pair<Integer, TransactionTree>> retVal=new ArrayList<Pair<Integer,TransactionTree>>();
+			List<Tuple2<Integer,TransactionTree>> retVal=new ArrayList<Tuple2<Integer,TransactionTree>>();
 			List<Integer> items = line.getValues();
 			OpenIntHashSet itemSet = new OpenIntHashSet();
 
@@ -174,31 +173,81 @@ public class Main
 					IntArrayList tempItems = new IntArrayList(j + 1);
 					tempItems.addAllOfFromTo(itemArr, 0, j);
 					//context.setStatus("Parallel FPGrowth: Generating Group Dependent transactions for: " + item);
-					retVal.add(new Pair<Integer, TransactionTree>(groupID, new TransactionTree(tempItems, 1L)));
+					retVal.add(new Tuple2<Integer, TransactionTree>(groupID, new TransactionTree(tempItems, 1L)));
 				}
 				groups.add(groupID);
 			}
 			return retVal;
 		}
-	
+
 		private int getGroupID (int item){
 			int maxPerGroup = (int)flistSize/numPerGroup;
 			return item/maxPerGroup;
 		}
 	}
 	
-	static class ParallelReducerToGroups implements Function2<List<Pair<Integer,TransactionTree>>, List<Pair<Integer,TransactionTree>>, List<Pair<Integer,TransactionTree>>>{
-		 
-		private static final long serialVersionUID = 1L;
+	static class ParallelReducer implements PairFunction<NumericLine, Integer,TransactionTree> {
+		//private static final long serialVersionUID = 1L;
+		private OpenObjectIntHashMap<Integer> fMap = new OpenObjectIntHashMap<Integer>();
+		//private OpenIntHashSet groups = new OpenIntHashSet();
+		//private long flistSize;
+		//private int numPerGroup;
 
-		public List<Pair<Integer, TransactionTree>> call(
-				List<Pair<Integer, TransactionTree>> list1,
-				List<Pair<Integer, TransactionTree>> list2) throws Exception {
-			list1.addAll(list2);
-			return list1;
+		//private final IntWritable wGroupID = new IntWritable();
+
+		public ParallelReducer(OpenObjectIntHashMap<Integer> fMap){
+			this.fMap=fMap;
 		}
 
-	}
-
+		public Tuple2<Integer, TransactionTree> call(NumericLine line)
+				throws Exception {
+			
+			
+			
+			TransactionTree cTree = new TransactionTree();
+		    for (TransactionTree tr : values) {
+		      for (Pair<IntArrayList,Long> p : tr) {
+		        cTree.addPattern(p.getFirst(), p.getSecond());
+		      }
+		    }
+		    
+		    List<Pair<Integer,Long>> localFList = Lists.newArrayList();
+		    for (Entry<Integer,MutableLong> fItem : cTree.generateFList().entrySet()) {
+		      localFList.add(new Pair<Integer,Long>(fItem.getKey(), fItem.getValue().toLong()));
+		    }
+		    
+		    Collections.sort(localFList, new CountDescendingPairComparator<Integer,Long>());
+		    
+		    if (useFP2) {
+		      FPGrowthIds.generateTopKFrequentPatterns(
+		          cTree.iterator(),
+		          freqList,
+		          minSupport,
+		          maxHeapSize,
+		          PFPGrowth.getGroupMembers(key.get(), maxPerGroup, numFeatures),
+		          new IntegerStringOutputConverter(
+		              new ContextWriteOutputCollector<IntWritable, TransactionTree, Text, TopKStringPatterns>(context),
+		              featureReverseMap)
+		      );
+		    } else {
+		      FPGrowth<Integer> fpGrowth = new FPGrowth<Integer>();
+		      fpGrowth.generateTopKFrequentPatterns(
+		          new IteratorAdapter(cTree.iterator()),
+		          localFList,
+		          minSupport,
+		          maxHeapSize,
+		          Sets.newHashSet(PFPGrowth.getGroupMembers(key.get(),
+		                                                         maxPerGroup, 
+		                                                         numFeatures).toList()),
+		          new IntegerStringOutputConverter(
+		              new ContextWriteOutputCollector<IntWritable,TransactionTree,Text,TopKStringPatterns>(context),
+		              featureReverseMap),
+		          new ContextStatusUpdater<IntWritable,TransactionTree,Text,TopKStringPatterns>(context));
+		    }
+		  }
+			return null;
+		}
+	
+	}	
 
 }
